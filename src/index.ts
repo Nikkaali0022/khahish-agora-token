@@ -1,3 +1,4 @@
+
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { RtcRole, RtcTokenBuilder } from "agora-token";
 
@@ -86,12 +87,15 @@ export default {
       const uid = payload.sub;
       const issuedAt = payload.iat;
       const authTime = payload.auth_time;
+      const expiresAt = payload.exp;
 
       if (
         typeof uid !== "string" ||
         uid.length === 0 ||
         typeof issuedAt !== "number" ||
         typeof authTime !== "number" ||
+        typeof expiresAt !== "number" ||
+        expiresAt <= now ||
         issuedAt > now + 60 ||
         authTime > now + 60 ||
         authTime > issuedAt + 60
