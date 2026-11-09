@@ -44,7 +44,8 @@ async function uidFromFirebaseUid(firebaseUid: string): Promise<number> {
   const hash = await crypto.subtle.digest("SHA-256", data);
   const view = new DataView(hash);
 
-  const uid = view.getUint32(0, false);
+  // Keep the value within Android/Kotlin signed Int range.
+  const uid = view.getUint32(0, false) & 0x7fffffff;
 
   return uid === 0 ? 1 : uid;
 }
