@@ -293,9 +293,9 @@ async function claimDispatch(
   const path = "pushDispatches/" + dispatchKey;
   const response = await firestoreRequest(
     accessToken,
-    path + "?currentDocument.exists=false",
+    "pushDispatches?documentId=" + encodeURIComponent(dispatchKey),
     {
-      method: "PATCH",
+      method: "POST",
       body: JSON.stringify({
         fields: {
           status: { stringValue: "processing" },
