@@ -568,15 +568,50 @@ export default {
         const uid = await verifyFirebaseUser(request);
         if (!uid) return json({ error: "Authentication required" }, 401);
 
-        let body: { channelName?: unknown };
+        let body: { callId?: unknown; channelName?: unknown };
         try {
-          body = (await request.json()) as { channelName?: unknown };
+          body = (await request.json()) as {
+            callId?: unknown;
+            channelName?: unknown;
+          };
         } catch {
           return json({ error: "Invalid request body" }, 400);
         }
 
-        if (!validChannelName(body.channelName)) {
-          return json({ error: "Invalid channel name" }, 400);
+        if (
+          typeof body.callId !== "string" ||
+          !body.callId.trim() ||
+          body.callId.length > 200 ||
+          !validChannelName(body.channelName)
+        ) {
+          return json({ error: "Invalid call or channel." }, 400);
+        }
+
+        // A Firebase login alone is not enough to mint a room token.
+        // Confirm this account is one of the two participants in this
+        // exact active call and that the client-supplied channel matches
+        // the server-stored channel name.
+        const accessToken = await getGoogleAccessToken(env);
+        const call = await getFirestoreDocument(
+          accessToken,
+          "calls/" + encodeURIComponent(body.callId)
+        );
+
+        if (!call) return json({ error: "Call not found." }, 404);
+
+        const callerUid = stringField(call, "callerUid");
+        const calleeUid = stringField(call, "calleeUid");
+        const callStatus = stringField(call, "status");
+        const storedChannel = stringField(call, "channelName");
+
+        if (uid !== callerUid && uid !== calleeUid) {
+          return json({ error: "You are not a participant in this call." }, 403);
+        }
+        if (callStatus !== "ringing" && callStatus !== "accepted") {
+          return json({ error: "This call is no longer active." }, 409);
+        }
+        if (!storedChannel || storedChannel !== body.channelName) {
+          return json({ error: "Call channel does not match." }, 403);
         }
 
         const agoraUid = await uidFromFirebaseUid(uid);
@@ -584,7 +619,7 @@ export default {
         const token = RtcTokenBuilder.buildTokenWithUid(
           env.AGORA_APP_ID,
           env.AGORA_APP_CERTIFICATE,
-          body.channelName,
+          storedChannel,
           agoraUid,
           RtcRole.PUBLISHER,
           expiresIn,
@@ -594,7 +629,8 @@ export default {
         return json({
           token,
           appId: env.AGORA_APP_ID,
-          channelName: body.channelName,
+          callId: body.callId,
+          channelName: storedChannel,
           uid: agoraUid,
           expiresIn
         });
