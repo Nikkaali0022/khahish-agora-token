@@ -392,8 +392,23 @@ async function sendToRecipients(
     const tokens = await listUserTokens(accessToken, recipientUid);
     attempted += tokens.length;
 
+    let recipientPayload = payload;
+    if (payload.type === "message") {
+      const lockConfig = await getFirestoreDocument(
+        accessToken,
+        secretLockPath(recipientUid)
+      );
+      if (stringArrayField(lockConfig, "lockedContactUids").includes(senderUid)) {
+        recipientPayload = {
+          ...payload,
+          title: "Khahish • Locked Chat",
+          body: "New message in a locked chat. Unlock Khahish to view it."
+        };
+      }
+    }
+
     const results = await Promise.allSettled(
-      tokens.map((item) => sendFcm(accessToken, item.token, payload))
+      tokens.map((item) => sendFcm(accessToken, item.token, recipientPayload))
     );
     sent += results.filter((result) => result.status === "fulfilled").length;
   }
@@ -758,6 +773,12 @@ async function handleSecretChatPassword(
     }
     const fields = await makeSecretPasswordFields(password as string, lockedContactUids);
     await writeFirestoreDocument(accessToken, path, fields);
+    const expiresAt = new Date(Date.now() + SECRET_LOCK_SESSION_MINUTES * 60_000).toISOString();
+    await writeFirestoreDocument(accessToken, secretLockSessionPath(uid), {
+      expiresAt: { timestampValue: expiresAt },
+      createdAt: { integerValue: String(Date.now()) }
+    });
+    return json({ ok: true, expiresAt, sessionMinutes: SECRET_LOCK_SESSION_MINUTES });
   } else {
     if (!existing || !(await verifyStoredSecretPassword(existing, currentPassword as string))) {
       return json({ error: "Current password is incorrect." }, 403);
