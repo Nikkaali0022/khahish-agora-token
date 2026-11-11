@@ -636,7 +636,7 @@ export default {
         });
       } catch (error) {
         console.error("Agora token request failed:", error);
-        return json({ error: "Authentication or token request failed" }, 401);
+        return json({ error: "Call authorization or token service unavailable." }, 500);
       }
     }
 
