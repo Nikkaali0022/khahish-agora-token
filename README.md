@@ -31,7 +31,7 @@ Never commit either secret to GitHub or put it in the Android APK.
 6. In Cloudflare, open the \`khahish-agora-token\` Worker → Settings → Variables and Secrets. Add \`FIREBASE_SERVICE_ACCOUNT_JSON\` as an encrypted secret. Do not paste the key into this repository, a chat, or the Android project.
 7. Keep \`FIREBASE_PROJECT_ID\` set to \`khahish-final\`.
 
-The `FIREBASE_SERVICE_ACCOUNT_JSON` secret is required for both RTC call authorization and FCM delivery. For RTC token requests, the Worker reads the call document with this service account before issuing any Agora token. The Worker verifies every Firebase ID token against the Khahish Firebase project. It checks that the authenticated sender owns the message or outgoing call, verifies chat membership, checks recipient block records, and uses a server-side dispatch record to avoid repeat sends. Message notifications contain a generic preview rather than the private message text.
+The `FIREBASE_SERVICE_ACCOUNT_JSON` secret is required for FCM delivery. For RTC token requests, the Worker reads the call document using the caller's Firebase ID token, so Firestore Security Rules enforce that only the caller or callee can read that call. The Worker verifies every Firebase ID token against the Khahish Firebase project. It checks that the authenticated sender owns the message or outgoing call, verifies chat membership, checks recipient block records, and uses a server-side dispatch record to avoid repeat sends. Message notifications contain a generic preview rather than the private message text.
 
 ## API
 
