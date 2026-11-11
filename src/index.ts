@@ -77,11 +77,18 @@ async function verifyFirebaseUser(request: Request): Promise<string | null> {
   const match = authorization.match(/^Bearer\s+(.+)$/i);
   if (!match) return null;
 
-  const verified = await jwtVerify(match[1], FIREBASE_KEYS, {
-    algorithms: ["RS256"],
-    issuer: ISSUER,
-    audience: PROJECT_ID
-  });
+  let verified;
+  try {
+    verified = await jwtVerify(match[1], FIREBASE_KEYS, {
+      algorithms: ["RS256"],
+      issuer: ISSUER,
+      audience: PROJECT_ID
+    });
+  } catch {
+    // Invalid, expired, or incorrectly signed Firebase tokens are
+    // authentication failures, not internal server errors.
+    return null;
+  }
 
   const payload = verified.payload;
   const now = Math.floor(Date.now() / 1000);
