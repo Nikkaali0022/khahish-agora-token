@@ -51,10 +51,12 @@ Headers:
 Body:
 
 \`\`\`json
-{ "channelName": "your-call-channel" }
+{ "callId": "firestore-call-document-id", "channelName": "your-call-channel" }
 \`\`\`
 
 The Firebase ID token must belong to \`khahish-final\`. Agora credentials are short-lived; the App Certificate remains server-side.
+
+The Worker reads the call document with its server-side Firebase service account and issues a token only when the authenticated Firebase UID is the caller or callee, the call is still ringing or accepted, and the supplied channel exactly matches the stored call channel.
 
 ### New message push
 
