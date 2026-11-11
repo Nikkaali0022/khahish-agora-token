@@ -57,10 +57,12 @@ function validChannelName(value: unknown): value is string {
 
   const bytes = new TextEncoder().encode(value);
 
+  // Khahish generates channel names as "khahish_" + a UUID without hyphens.
+  // Keep validation deliberately simple and aligned with that format.
   return (
     bytes.length > 0 &&
     bytes.length < 64 &&
-    /^[a-zA-Z0-9!#$%&()+\-:;,.=?@[\\]^_{|}~]+$/.test(value)
+    /^[A-Za-z0-9_-]+$/.test(value)
   );
 }
 
