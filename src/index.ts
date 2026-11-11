@@ -201,6 +201,24 @@ async function getFirestoreDocument(
   return (await response.json()) as FirestoreDocument;
 }
 
+async function getFirestoreDocumentAsUser(
+  request: Request,
+  relativePath: string
+): Promise<FirestoreDocument | null> {
+  const authorization = request.headers.get("Authorization") || "";
+  const response = await fetch(FIRESTORE_ROOT + "/" + relativePath, {
+    headers: {
+      Authorization: authorization,
+      Accept: "application/json"
+    }
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error("Could not verify the active call record.");
+  }
+  return (await response.json()) as FirestoreDocument;
+}
+
 function stringField(
   document: FirestoreDocument | null,
   field: string
@@ -591,9 +609,10 @@ export default {
         // Confirm this account is one of the two participants in this
         // exact active call and that the client-supplied channel matches
         // the server-stored channel name.
-        const accessToken = await getGoogleAccessToken(env);
-        const call = await getFirestoreDocument(
-          accessToken,
+        // Read with the caller's Firebase ID token so Firestore Security
+        // Rules enforce caller/callee membership for this exact call record.
+        const call = await getFirestoreDocumentAsUser(
+          request,
           "calls/" + encodeURIComponent(body.callId)
         );
 
