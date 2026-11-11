@@ -616,8 +616,10 @@ async function deriveSecretPasswordHash(
     false,
     ["deriveBits"]
   );
+  const saltCopy = new Uint8Array(salt.length);
+  saltCopy.set(salt);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    { name: "PBKDF2", salt: saltCopy.buffer as ArrayBuffer, iterations, hash: "SHA-256" },
     key,
     256
   );
