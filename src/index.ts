@@ -704,6 +704,38 @@ async function makeSecretPasswordFields(
   };
 }
 
+async function allowPasswordAttempt(
+  accessToken: string,
+  uid: string
+): Promise<boolean> {
+  const path = "users/" + encodeURIComponent(uid) + "/secretChatLock/attempts";
+  const record = await getFirestoreDocument(accessToken, path);
+  const count = integerField(record, "count");
+  const start = record?.fields?.windowStartedAt?.timestampValue;
+  const activeWindow = typeof start === "string" &&
+    Date.now() - Date.parse(start) < 15 * 60_000;
+  if (activeWindow && count >= 5) return false;
+
+  const nextCount = activeWindow ? count + 1 : 1;
+  const windowStartedAt = activeWindow ? start : new Date().toISOString();
+  await writeFirestoreDocument(accessToken, path, {
+    count: { integerValue: String(nextCount) },
+    windowStartedAt: { timestampValue: windowStartedAt }
+  });
+  return true;
+}
+
+async function clearPasswordAttempts(
+  accessToken: string,
+  uid: string
+): Promise<void> {
+  await firestoreRequest(
+    accessToken,
+    "users/" + encodeURIComponent(uid) + "/secretChatLock/attempts",
+    { method: "DELETE" }
+  );
+}
+
 async function requireSecretLockSession(
   accessToken: string,
   uid: string
@@ -780,12 +812,15 @@ async function handleSecretChatPassword(
     });
     return json({ ok: true, expiresAt, sessionMinutes: SECRET_LOCK_SESSION_MINUTES });
   } else {
+    if (!(await allowPasswordAttempt(accessToken, uid))) {
+      return json({ error: "Too many password attempts. Try again in 15 minutes." }, 429);
+    }
     if (!existing || !(await verifyStoredSecretPassword(existing, currentPassword as string))) {
       return json({ error: "Current password is incorrect." }, 403);
     }
+    await clearPasswordAttempts(accessToken, uid);
     const fields = await makeSecretPasswordFields(newPassword as string, lockedContactUids);
     await writeFirestoreDocument(accessToken, path, fields);
-    await firestoreRequest(accessToken, secretLockSessionPath(uid), { method: "DELETE" });
   }
 
   return json({ ok: true });
@@ -807,10 +842,14 @@ async function handleSecretChatUnlock(
   }
 
   const accessToken = await getGoogleAccessToken(env);
+  if (!(await allowPasswordAttempt(accessToken, uid))) {
+    return json({ error: "Too many password attempts. Try again in 15 minutes." }, 429);
+  }
   const config = await getFirestoreDocument(accessToken, secretLockPath(uid));
   if (!config || !(await verifyStoredSecretPassword(config, body.password))) {
     return json({ error: "Incorrect password." }, 403);
   }
+  await clearPasswordAttempts(accessToken, uid);
 
   const expiresAt = new Date(Date.now() + SECRET_LOCK_SESSION_MINUTES * 60_000).toISOString();
   await writeFirestoreDocument(accessToken, secretLockSessionPath(uid), {
