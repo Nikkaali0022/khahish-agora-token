@@ -845,20 +845,23 @@ async function handleSecretChatContacts(
   if (body.action === "add") contacts.add(body.contactUid);
   else contacts.delete(body.contactUid);
 
-  await firestoreRequest(accessToken, path, {
-    method: "PATCH",
-    body: JSON.stringify({
-      fields: {
-        lockedContactUids: {
-          arrayValue: {
-            values: [...contacts].map((contactUid) => ({ stringValue: contactUid }))
-          }
-        },
-        updatedAt: { integerValue: String(Date.now()) }
-      }
-    }),
-    headers: { "X-Goog-FieldMask": "lockedContactUids,updatedAt" }
-  });
+  await firestoreRequest(
+    accessToken,
+    path + "?updateMask.fieldPaths=lockedContactUids&updateMask.fieldPaths=updatedAt",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          lockedContactUids: {
+            arrayValue: {
+              values: [...contacts].map((contactUid) => ({ stringValue: contactUid }))
+            }
+          },
+          updatedAt: { integerValue: String(Date.now()) }
+        }
+      })
+    }
+  );
 
   return json({ ok: true, lockedContactUids: [...contacts] });
 }
