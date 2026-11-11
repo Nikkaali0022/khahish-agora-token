@@ -3,5 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-11-09"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+AGORA_APP_ID = "91b5fcb71f4a4e4db30dbd42d231c173"
+FIREBASE_PROJECT_ID = "khahish-final"
+
 [observability]
 enabled = true
