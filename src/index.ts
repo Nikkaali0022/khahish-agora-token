@@ -1014,6 +1014,59 @@ async function handleSecretChatContacts(
   return json({ ok: true, lockedContactUids: [...contacts] });
 }
 
+async function handleSecretChatSync(
+  request: Request,
+  env: Env,
+  uid: string
+): Promise<Response> {
+  let body: { chatId?: unknown };
+  try {
+    body = (await request.json()) as { chatId?: unknown };
+  } catch {
+    return json({ error: "Invalid request body." }, 400);
+  }
+  if (typeof body.chatId !== "string" || !body.chatId.trim() || body.chatId.length > 200 || body.chatId.includes("/")) {
+    return json({ error: "Invalid chat." }, 400);
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  const chatPath = "chats/" + encodeURIComponent(body.chatId);
+  const chat = await getFirestoreDocument(accessToken, chatPath);
+  if (!chat) return json({ error: "Chat not found." }, 404);
+  const members = stringArrayField(chat, "members");
+  if (!members.includes(uid)) return json({ error: "You are not a member of this chat." }, 403);
+
+  const isGroup = chat.fields?.isGroup?.booleanValue === true;
+  const lockedFor: string[] = [];
+  if (!isGroup && members.length === 2) {
+    for (const ownerUid of members) {
+      const peerUid = members.find((memberUid) => memberUid !== ownerUid);
+      if (!peerUid) continue;
+      const config = await getFirestoreDocument(accessToken, secretLockPath(ownerUid));
+      if (stringArrayField(config, "lockedContactUids").includes(peerUid)) {
+        lockedFor.push(ownerUid);
+      }
+    }
+  }
+
+  const update = await firestoreRequest(
+    accessToken,
+    chatPath + "?updateMask.fieldPaths=secretLockedForUids",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          secretLockedForUids: {
+            arrayValue: { values: lockedFor.map((memberUid) => ({ stringValue: memberUid })) }
+          }
+        }
+      })
+    }
+  );
+  if (!update.ok) return json({ error: "Could not synchronize chat privacy." }, 500);
+  return json({ ok: true, secretLockedForUids: lockedFor });
+}
+
 async function handleSecretChatLock(
   env: Env,
   uid: string
@@ -1057,6 +1110,9 @@ export default {
         }
         if (request.method === "POST" && url.pathname === "/secret-chats/contacts") {
           return await handleSecretChatContacts(request, env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/sync-chat") {
+          return await handleSecretChatSync(request, env, uid);
         }
         if (request.method === "POST" && url.pathname === "/secret-chats/lock") {
           return await handleSecretChatLock(env, uid);
