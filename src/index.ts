@@ -280,7 +280,8 @@ async function syncSecretLockedChatList(
     const peerUid = members.find((memberUid) => memberUid !== uid);
     const shouldHide = !isGroup && members.length === 2 && !!peerUid && lockedContacts.has(peerUid);
     const current = stringArrayField(document, "visibleToUids");
-    const next = new Set(current);
+    // Discard any stale/non-member UIDs before applying this member's visibility.
+    const next = new Set(current.filter((memberUid) => members.includes(memberUid)));
     if (shouldHide) next.delete(uid);
     else next.add(uid);
     const nextValues = [...next];
