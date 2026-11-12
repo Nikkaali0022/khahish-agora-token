@@ -279,15 +279,22 @@ async function syncSecretLockedChatList(
     const isGroup = document.fields?.isGroup?.booleanValue === true;
     const peerUid = members.find((memberUid) => memberUid !== uid);
     const shouldHide = !isGroup && members.length === 2 && !!peerUid && lockedContacts.has(peerUid);
-    const visibilityField = "secretLockedFor_" + uid;
-    const currentValue = document.fields?.[visibilityField]?.booleanValue;
-    if (currentValue === shouldHide) return [];
+    const current = stringArrayField(document, "visibleToUids");
+    const next = new Set(current);
+    if (shouldHide) next.delete(uid);
+    else next.add(uid);
+    const nextValues = [...next];
+    if (current.length === nextValues.length && current.every((value) => next.has(value))) return [];
     return [{
       update: {
         name,
-        fields: { [visibilityField]: { booleanValue: shouldHide } }
+        fields: {
+          visibleToUids: {
+            arrayValue: { values: nextValues.map((value) => ({ stringValue: value })) }
+          }
+        }
       },
-      updateMask: { fieldPaths: [visibilityField] }
+      updateMask: { fieldPaths: ["visibleToUids"] }
     }];
   });
 
@@ -1030,8 +1037,7 @@ async function handleSecretChatSync(
   if (!members.includes(uid)) return json({ error: "You are not a member of this chat." }, 403);
 
   const isGroup = chat.fields?.isGroup?.booleanValue === true;
-  const visibilityFields: Record<string, unknown> = {};
-  const updateMasks: string[] = [];
+  const visibleToUids: string[] = [];
   for (const ownerUid of members) {
     let shouldHide = false;
     if (!isGroup && members.length === 2) {
@@ -1041,17 +1047,21 @@ async function handleSecretChatSync(
         shouldHide = stringArrayField(config, "lockedContactUids").includes(peerUid);
       }
     }
-    const fieldPath = "secretLockedFor_" + ownerUid;
-    visibilityFields[fieldPath] = { booleanValue: shouldHide };
-    updateMasks.push(fieldPath);
+    if (!shouldHide) visibleToUids.push(ownerUid);
   }
 
   const update = await firestoreRequest(
     accessToken,
-    chatPath + "?" + updateMasks.map((field) => "updateMask.fieldPaths=" + encodeURIComponent(field)).join("&"),
+    chatPath + "?updateMask.fieldPaths=visibleToUids",
     {
       method: "PATCH",
-      body: JSON.stringify({ fields: visibilityFields })
+      body: JSON.stringify({
+        fields: {
+          visibleToUids: {
+            arrayValue: { values: visibleToUids.map((memberUid) => ({ stringValue: memberUid })) }
+          }
+        }
+      })
     }
   );
   if (!update.ok) return json({ error: "Could not synchronize chat privacy." }, 500);
