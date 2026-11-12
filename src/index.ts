@@ -713,7 +713,7 @@ function secretLockPath(uid: string): string {
 }
 
 function secretLockSessionPath(uid: string): string {
-  return "users/" + encodeURIComponent(uid) + "/secretChatLock/sessions/current";
+  return "users/" + encodeURIComponent(uid) + "/secretChatLock/config/sessions/current";
 }
 
 async function writeFirestoreDocument(
