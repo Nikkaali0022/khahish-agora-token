@@ -907,7 +907,7 @@ async function handleSecretChatContacts(
   if (body.action === "add") contacts.add(body.contactUid);
   else contacts.delete(body.contactUid);
 
-  await firestoreRequest(
+  const updateResponse = await firestoreRequest(
     accessToken,
     path + "?updateMask.fieldPaths=lockedContactUids&updateMask.fieldPaths=updatedAt",
     {
@@ -924,6 +924,10 @@ async function handleSecretChatContacts(
       })
     }
   );
+  if (!updateResponse.ok) {
+    console.error("Secret Locked Chats contact update failed:", updateResponse.status);
+    return json({ error: "Could not update your locked contacts. Please try again." }, 500);
+  }
 
   return json({ ok: true, lockedContactUids: [...contacts] });
 }
