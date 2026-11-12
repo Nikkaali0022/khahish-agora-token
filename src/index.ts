@@ -245,6 +245,75 @@ function stringArrayField(
     .filter((value: unknown): value is string => typeof value === "string");
 }
 
+async function syncSecretLockedChatList(
+  accessToken: string,
+  uid: string,
+  lockedContactUids: string[]
+): Promise<void> {
+  const queryResponse = await firestoreRequest(accessToken, ":runQuery", {
+    method: "POST",
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId: "chats" }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: "members" },
+            op: "ARRAY_CONTAINS",
+            value: { stringValue: uid }
+          }
+        }
+      }
+    })
+  });
+  if (!queryResponse.ok) {
+    throw new Error("Could not read chats to synchronize Secret Locked Chats.");
+  }
+
+  const rows = (await queryResponse.json()) as Array<{ document?: FirestoreDocument }>;
+  const lockedContacts = new Set(lockedContactUids);
+  const writes = rows.flatMap((row) => {
+    const document = row.document;
+    const name = document?.name;
+    if (!document || !name) return [];
+    const members = stringArrayField(document, "members");
+    const isGroup = document.fields?.isGroup?.booleanValue === true;
+    const peerUid = members.find((memberUid) => memberUid !== uid);
+    const shouldHide = !isGroup && members.length === 2 && !!peerUid && lockedContacts.has(peerUid);
+    const current = stringArrayField(document, "visibleToUids");
+    // Discard any stale/non-member UIDs before applying this member's visibility.
+    const next = new Set(current.filter((memberUid) => members.includes(memberUid)));
+    if (shouldHide) next.delete(uid);
+    else next.add(uid);
+    const nextValues = [...next];
+    if (current.length === nextValues.length && current.every((value) => next.has(value))) return [];
+    return [{
+      update: {
+        name,
+        fields: {
+          visibleToUids: {
+            arrayValue: { values: nextValues.map((value) => ({ stringValue: value })) }
+          }
+        }
+      },
+      updateMask: { fieldPaths: ["visibleToUids"] }
+    }];
+  });
+
+  for (let offset = 0; offset < writes.length; offset += 450) {
+    const batchResponse = await firestoreRequest(accessToken, ":batchWrite", {
+      method: "POST",
+      body: JSON.stringify({ writes: writes.slice(offset, offset + 450) })
+    });
+    if (!batchResponse.ok) {
+      throw new Error("Could not update chat visibility for Secret Locked Chats.");
+    }
+    const result = (await batchResponse.json()) as { status?: Array<{ code?: number }> };
+    if (result.status?.some((status) => typeof status.code === "number" && status.code !== 0)) {
+      throw new Error("Some chat visibility records could not be updated.");
+    }
+  }
+}
+
 async function listUserTokens(
   accessToken: string,
   uid: string
@@ -392,8 +461,23 @@ async function sendToRecipients(
     const tokens = await listUserTokens(accessToken, recipientUid);
     attempted += tokens.length;
 
+    let recipientPayload = payload;
+    if (payload.type === "message") {
+      const lockConfig = await getFirestoreDocument(
+        accessToken,
+        secretLockPath(recipientUid)
+      );
+      if (stringArrayField(lockConfig, "lockedContactUids").includes(senderUid)) {
+        recipientPayload = {
+          ...payload,
+          title: "Khahish • Locked Chat",
+          body: "New message in a locked chat. Unlock Khahish to view it."
+        };
+      }
+    }
+
     const results = await Promise.allSettled(
-      tokens.map((item) => sendFcm(accessToken, item.token, payload))
+      tokens.map((item) => sendFcm(accessToken, item.token, recipientPayload))
     );
     sent += results.filter((result) => result.status === "fulfilled").length;
   }
@@ -574,12 +658,472 @@ async function handleCallPush(
   }
 }
 
+
+const SECRET_LOCK_ITERATIONS = 160_000;
+const SECRET_LOCK_SESSION_MINUTES = 20;
+
+function base64Encode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function base64Decode(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function deriveSecretPasswordHash(
+  password: string,
+  salt: Uint8Array,
+  iterations: number
+): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const saltBuffer = new ArrayBuffer(salt.length);
+  new Uint8Array(saltBuffer).set(salt);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: saltBuffer, iterations, hash: "SHA-256" },
+    key,
+    256
+  );
+  return new Uint8Array(bits);
+}
+
+function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i++) difference |= left[i] ^ right[i];
+  return difference === 0;
+}
+
+function integerField(document: FirestoreDocument | null, field: string): number {
+  const raw = document?.fields?.[field]?.integerValue;
+  const value = typeof raw === "string" ? Number(raw) : Number(raw || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function secretLockPath(uid: string): string {
+  return "users/" + encodeURIComponent(uid) + "/secretChatLock/config";
+}
+
+function secretLockSessionPath(uid: string): string {
+  return "users/" + encodeURIComponent(uid) + "/secretChatLock/config/sessions/current";
+}
+
+async function writeFirestoreDocument(
+  accessToken: string,
+  relativePath: string,
+  fields: Record<string, unknown>
+): Promise<void> {
+  const response = await firestoreRequest(accessToken, relativePath, {
+    method: "PATCH",
+    body: JSON.stringify({ fields })
+  });
+  if (!response.ok) {
+    throw new Error("Could not save the Secret Locked Chats security record.");
+  }
+}
+
+async function verifyStoredSecretPassword(
+  config: FirestoreDocument,
+  password: string
+): Promise<boolean> {
+  const saltText = stringField(config, "passwordSalt");
+  const hashText = stringField(config, "passwordHash");
+  const iterations = integerField(config, "iterations");
+  if (!saltText || !hashText || iterations < 100_000 || iterations > 500_000) {
+    return false;
+  }
+  try {
+    const actual = await deriveSecretPasswordHash(
+      password,
+      base64Decode(saltText),
+      iterations
+    );
+    return constantTimeEqual(actual, base64Decode(hashText));
+  } catch {
+    return false;
+  }
+}
+
+async function makeSecretPasswordFields(
+  password: string,
+  lockedContactUids: string[]
+): Promise<Record<string, unknown>> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await deriveSecretPasswordHash(
+    password,
+    salt,
+    SECRET_LOCK_ITERATIONS
+  );
+  return {
+    passwordSalt: { stringValue: base64Encode(salt) },
+    passwordHash: { stringValue: base64Encode(hash) },
+    iterations: { integerValue: String(SECRET_LOCK_ITERATIONS) },
+    lockedContactUids: {
+      arrayValue: {
+        values: lockedContactUids.map((uid) => ({ stringValue: uid }))
+      }
+    },
+    updatedAt: { integerValue: String(Date.now()) }
+  };
+}
+
+async function allowPasswordAttempt(
+  accessToken: string,
+  uid: string
+): Promise<boolean> {
+  const path = "users/" + encodeURIComponent(uid) + "/secretChatLock/attempts";
+  const record = await getFirestoreDocument(accessToken, path);
+  const count = integerField(record, "count");
+  const start = record?.fields?.windowStartedAt?.timestampValue;
+  const activeWindow = typeof start === "string" &&
+    Date.now() - Date.parse(start) < 15 * 60_000;
+  if (activeWindow && count >= 5) return false;
+
+  const nextCount = activeWindow ? count + 1 : 1;
+  const windowStartedAt = activeWindow ? start : new Date().toISOString();
+  await writeFirestoreDocument(accessToken, path, {
+    count: { integerValue: String(nextCount) },
+    windowStartedAt: { timestampValue: windowStartedAt }
+  });
+  return true;
+}
+
+async function clearPasswordAttempts(
+  accessToken: string,
+  uid: string
+): Promise<void> {
+  await firestoreRequest(
+    accessToken,
+    "users/" + encodeURIComponent(uid) + "/secretChatLock/attempts",
+    { method: "DELETE" }
+  );
+}
+
+async function requireSecretLockSession(
+  accessToken: string,
+  uid: string
+): Promise<boolean> {
+  const session = await getFirestoreDocument(
+    accessToken,
+    secretLockSessionPath(uid)
+  );
+  const expiry = session?.fields?.expiresAt?.timestampValue;
+  return typeof expiry === "string" && Date.parse(expiry) > Date.now();
+}
+
+async function handleSecretChatConfig(
+  env: Env,
+  uid: string
+): Promise<Response> {
+  const accessToken = await getGoogleAccessToken(env);
+  const config = await getFirestoreDocument(accessToken, secretLockPath(uid));
+  const lockedContactUids = stringArrayField(config, "lockedContactUids");
+  await syncSecretLockedChatList(accessToken, uid, lockedContactUids);
+  return json({
+    hasPassword: Boolean(stringField(config, "passwordHash")),
+    lockedContactUids
+  });
+}
+
+async function handleSecretChatPassword(
+  request: Request,
+  env: Env,
+  uid: string
+): Promise<Response> {
+  let body: {
+    action?: unknown;
+    password?: unknown;
+    currentPassword?: unknown;
+    newPassword?: unknown;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: "Invalid request body." }, 400);
+  }
+
+  const action = body.action;
+  const password = body.password;
+  const currentPassword = body.currentPassword;
+  const newPassword = body.newPassword;
+  if (
+    (action !== "create" && action !== "change") ||
+    (action === "create" &&
+      (typeof password !== "string" || password.length < 8 || password.length > 128)) ||
+    (action === "change" &&
+      (typeof currentPassword !== "string" ||
+        typeof newPassword !== "string" ||
+        newPassword.length < 8 ||
+        newPassword.length > 128))
+  ) {
+    return json({ error: "Password must contain 8 to 128 characters." }, 400);
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  const path = secretLockPath(uid);
+  const existing = await getFirestoreDocument(accessToken, path);
+  const lockedContactUids = stringArrayField(existing, "lockedContactUids");
+
+  if (action === "create") {
+    if (stringField(existing, "passwordHash")) {
+      return json({ error: "A Secret Locked Chats password already exists." }, 409);
+    }
+    const fields = await makeSecretPasswordFields(password as string, lockedContactUids);
+    await writeFirestoreDocument(accessToken, path, fields);
+    const expiresAt = new Date(Date.now() + SECRET_LOCK_SESSION_MINUTES * 60_000).toISOString();
+    await writeFirestoreDocument(accessToken, secretLockSessionPath(uid), {
+      expiresAt: { timestampValue: expiresAt },
+      createdAt: { integerValue: String(Date.now()) }
+    });
+    return json({ ok: true, expiresAt, sessionMinutes: SECRET_LOCK_SESSION_MINUTES });
+  } else {
+    if (!(await allowPasswordAttempt(accessToken, uid))) {
+      return json({ error: "Too many password attempts. Try again in 15 minutes." }, 429);
+    }
+    if (!existing || !(await verifyStoredSecretPassword(existing, currentPassword as string))) {
+      return json({ error: "Current password is incorrect." }, 403);
+    }
+    await clearPasswordAttempts(accessToken, uid);
+    const fields = await makeSecretPasswordFields(newPassword as string, lockedContactUids);
+    await writeFirestoreDocument(accessToken, path, fields);
+  }
+
+  return json({ ok: true });
+}
+
+async function handleSecretChatUnlock(
+  request: Request,
+  env: Env,
+  uid: string
+): Promise<Response> {
+  let body: { password?: unknown };
+  try {
+    body = (await request.json()) as { password?: unknown };
+  } catch {
+    return json({ error: "Invalid request body." }, 400);
+  }
+  if (typeof body.password !== "string" || body.password.length < 1 || body.password.length > 128) {
+    return json({ error: "Enter your Secret Locked Chats password." }, 400);
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  if (!(await allowPasswordAttempt(accessToken, uid))) {
+    return json({ error: "Too many password attempts. Try again in 15 minutes." }, 429);
+  }
+  const config = await getFirestoreDocument(accessToken, secretLockPath(uid));
+  if (!config || !(await verifyStoredSecretPassword(config, body.password))) {
+    return json({ error: "Incorrect password." }, 403);
+  }
+  await clearPasswordAttempts(accessToken, uid);
+
+  const expiresAt = new Date(Date.now() + SECRET_LOCK_SESSION_MINUTES * 60_000).toISOString();
+  await writeFirestoreDocument(accessToken, secretLockSessionPath(uid), {
+    expiresAt: { timestampValue: expiresAt },
+    createdAt: { integerValue: String(Date.now()) }
+  });
+  return json({
+    ok: true,
+    expiresAt,
+    sessionMinutes: SECRET_LOCK_SESSION_MINUTES
+  });
+}
+
+async function handleSecretChatContacts(
+  request: Request,
+  env: Env,
+  uid: string
+): Promise<Response> {
+  let body: { action?: unknown; contactUid?: unknown };
+  try {
+    body = (await request.json()) as { action?: unknown; contactUid?: unknown };
+  } catch {
+    return json({ error: "Invalid request body." }, 400);
+  }
+  if (
+    (body.action !== "add" && body.action !== "remove") ||
+    typeof body.contactUid !== "string" ||
+    !body.contactUid ||
+    body.contactUid === uid ||
+    body.contactUid.length > 128
+  ) {
+    return json({ error: "Invalid locked contact." }, 400);
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  if (!(await requireSecretLockSession(accessToken, uid))) {
+    return json({ error: "Unlock Locked Chats again before changing contacts." }, 403);
+  }
+
+  const target = await getFirestoreDocument(
+    accessToken,
+    "publicProfiles/" + encodeURIComponent(body.contactUid)
+  );
+  if (!target) return json({ error: "Contact profile not found." }, 404);
+
+  const path = secretLockPath(uid);
+  const config = await getFirestoreDocument(accessToken, path);
+  if (!config || !stringField(config, "passwordHash")) {
+    return json({ error: "Create your Secret Locked Chats password first." }, 409);
+  }
+
+  const contacts = new Set(stringArrayField(config, "lockedContactUids"));
+  if (body.action === "add") contacts.add(body.contactUid);
+  else contacts.delete(body.contactUid);
+
+  // Lock first when adding a contact, so a failed config write never hides
+  // the contact from security rules without the matching server-side config.
+  if (body.action === "add") {
+    await syncSecretLockedChatList(accessToken, uid, [...contacts]);
+  }
+
+  const updateResponse = await firestoreRequest(
+    accessToken,
+    path + "?updateMask.fieldPaths=lockedContactUids&updateMask.fieldPaths=updatedAt",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          lockedContactUids: {
+            arrayValue: {
+              values: [...contacts].map((contactUid) => ({ stringValue: contactUid }))
+            }
+          },
+          updatedAt: { integerValue: String(Date.now()) }
+        }
+      })
+    }
+  );
+  if (!updateResponse.ok) {
+    console.error("Secret Locked Chats contact update failed:", updateResponse.status);
+    return json({ error: "Could not update your locked contacts. Please try again." }, 500);
+  }
+
+  // When removing a lock, update the config first. A failed visibility sync
+  // then leaves the chat hidden (safe) until the next config refresh repairs it.
+  if (body.action === "remove") {
+    await syncSecretLockedChatList(accessToken, uid, [...contacts]);
+  }
+
+  return json({ ok: true, lockedContactUids: [...contacts] });
+}
+
+async function handleSecretChatSync(
+  request: Request,
+  env: Env,
+  uid: string
+): Promise<Response> {
+  let body: { chatId?: unknown };
+  try {
+    body = (await request.json()) as { chatId?: unknown };
+  } catch {
+    return json({ error: "Invalid request body." }, 400);
+  }
+  if (typeof body.chatId !== "string" || !body.chatId.trim() || body.chatId.length > 200 || body.chatId.includes("/")) {
+    return json({ error: "Invalid chat." }, 400);
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  const chatPath = "chats/" + encodeURIComponent(body.chatId);
+  const chat = await getFirestoreDocument(accessToken, chatPath);
+  if (!chat) return json({ error: "Chat not found." }, 404);
+  const members = stringArrayField(chat, "members");
+  if (!members.includes(uid)) return json({ error: "You are not a member of this chat." }, 403);
+
+  const isGroup = chat.fields?.isGroup?.booleanValue === true;
+  const visibleToUids: string[] = [];
+  for (const ownerUid of members) {
+    let shouldHide = false;
+    if (!isGroup && members.length === 2) {
+      const peerUid = members.find((memberUid) => memberUid !== ownerUid);
+      if (peerUid) {
+        const config = await getFirestoreDocument(accessToken, secretLockPath(ownerUid));
+        shouldHide = stringArrayField(config, "lockedContactUids").includes(peerUid);
+      }
+    }
+    if (!shouldHide) visibleToUids.push(ownerUid);
+  }
+
+  const update = await firestoreRequest(
+    accessToken,
+    chatPath + "?updateMask.fieldPaths=visibleToUids",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          visibleToUids: {
+            arrayValue: { values: visibleToUids.map((memberUid) => ({ stringValue: memberUid })) }
+          }
+        }
+      })
+    }
+  );
+  if (!update.ok) return json({ error: "Could not synchronize chat privacy." }, 500);
+  return json({ ok: true });
+}
+
+async function handleSecretChatLock(
+  env: Env,
+  uid: string
+): Promise<Response> {
+  const accessToken = await getGoogleAccessToken(env);
+  const response = await firestoreRequest(
+    accessToken,
+    secretLockSessionPath(uid),
+    { method: "DELETE" }
+  );
+  if (!response.ok && response.status !== 404) {
+    return json({ error: "Could not lock Secret Chats right now." }, 500);
+  }
+  return json({ ok: true });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ status: "ok", service: "khahish-agora-token" });
+    }
+
+    if (url.pathname.startsWith("/secret-chats/")) {
+      try {
+        if (env.FIREBASE_PROJECT_ID !== PROJECT_ID) {
+          return json({ error: "Server configuration error." }, 500);
+        }
+        const uid = await verifyFirebaseUser(request);
+        if (!uid) return json({ error: "Authentication required." }, 401);
+
+        if (request.method === "GET" && url.pathname === "/secret-chats/config") {
+          return await handleSecretChatConfig(env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/password") {
+          return await handleSecretChatPassword(request, env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/unlock") {
+          return await handleSecretChatUnlock(request, env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/contacts") {
+          return await handleSecretChatContacts(request, env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/sync-chat") {
+          return await handleSecretChatSync(request, env, uid);
+        }
+        if (request.method === "POST" && url.pathname === "/secret-chats/lock") {
+          return await handleSecretChatLock(env, uid);
+        }
+        return json({ error: "Not found." }, 404);
+      } catch (error) {
+        console.error("Secret Locked Chats request failed:", error);
+        return json({ error: "Secret Locked Chats service unavailable." }, 500);
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/rtc/token") {
