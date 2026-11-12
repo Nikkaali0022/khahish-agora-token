@@ -245,6 +245,74 @@ function stringArrayField(
     .filter((value: unknown): value is string => typeof value === "string");
 }
 
+async function syncSecretLockedChatList(
+  accessToken: string,
+  uid: string,
+  lockedContactUids: string[]
+): Promise<void> {
+  const queryResponse = await firestoreRequest(accessToken, ":runQuery", {
+    method: "POST",
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId: "chats" }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: "members" },
+            op: "ARRAY_CONTAINS",
+            value: { stringValue: uid }
+          }
+        }
+      }
+    })
+  });
+  if (!queryResponse.ok) {
+    throw new Error("Could not read chats to synchronize Secret Locked Chats.");
+  }
+
+  const rows = (await queryResponse.json()) as Array<{ document?: FirestoreDocument }>;
+  const lockedContacts = new Set(lockedContactUids);
+  const writes = rows.flatMap((row) => {
+    const document = row.document;
+    const name = document?.name;
+    if (!document || !name) return [];
+    const members = stringArrayField(document, "members");
+    const isGroup = document.fields?.isGroup?.booleanValue === true;
+    const peerUid = members.find((memberUid) => memberUid !== uid);
+    const shouldHide = !isGroup && members.length === 2 && !!peerUid && lockedContacts.has(peerUid);
+    const current = stringArrayField(document, "secretLockedForUids");
+    const next = new Set(current);
+    if (shouldHide) next.add(uid);
+    else next.delete(uid);
+    const nextValues = [...next];
+    if (current.length === nextValues.length && current.every((value) => next.has(value))) return [];
+    return [{
+      update: {
+        name,
+        fields: {
+          secretLockedForUids: {
+            arrayValue: { values: nextValues.map((value) => ({ stringValue: value })) }
+          }
+        }
+      },
+      updateMask: { fieldPaths: ["secretLockedForUids"] }
+    }];
+  });
+
+  for (let offset = 0; offset < writes.length; offset += 450) {
+    const batchResponse = await firestoreRequest(accessToken, ":batchWrite", {
+      method: "POST",
+      body: JSON.stringify({ writes: writes.slice(offset, offset + 450) })
+    });
+    if (!batchResponse.ok) {
+      throw new Error("Could not update chat visibility for Secret Locked Chats.");
+    }
+    const result = (await batchResponse.json()) as { status?: Array<{ code?: number }> };
+    if (result.status?.some((status) => typeof status.code === "number" && status.code !== 0)) {
+      throw new Error("Some chat visibility records could not be updated.");
+    }
+  }
+}
+
 async function listUserTokens(
   accessToken: string,
   uid: string
@@ -756,9 +824,11 @@ async function handleSecretChatConfig(
 ): Promise<Response> {
   const accessToken = await getGoogleAccessToken(env);
   const config = await getFirestoreDocument(accessToken, secretLockPath(uid));
+  const lockedContactUids = stringArrayField(config, "lockedContactUids");
+  await syncSecretLockedChatList(accessToken, uid, lockedContactUids);
   return json({
     hasPassword: Boolean(stringField(config, "passwordHash")),
-    lockedContactUids: stringArrayField(config, "lockedContactUids")
+    lockedContactUids
   });
 }
 
