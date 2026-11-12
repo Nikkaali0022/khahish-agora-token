@@ -279,22 +279,15 @@ async function syncSecretLockedChatList(
     const isGroup = document.fields?.isGroup?.booleanValue === true;
     const peerUid = members.find((memberUid) => memberUid !== uid);
     const shouldHide = !isGroup && members.length === 2 && !!peerUid && lockedContacts.has(peerUid);
-    const current = stringArrayField(document, "secretLockedForUids");
-    const next = new Set(current);
-    if (shouldHide) next.add(uid);
-    else next.delete(uid);
-    const nextValues = [...next];
-    if (current.length === nextValues.length && current.every((value) => next.has(value))) return [];
+    const visibilityField = "secretLockedFor_" + uid;
+    const currentValue = document.fields?.[visibilityField]?.booleanValue;
+    if (currentValue === shouldHide) return [];
     return [{
       update: {
         name,
-        fields: {
-          secretLockedForUids: {
-            arrayValue: { values: nextValues.map((value) => ({ stringValue: value })) }
-          }
-        }
+        fields: { [visibilityField]: { booleanValue: shouldHide } }
       },
-      updateMask: { fieldPaths: ["secretLockedForUids"] }
+      updateMask: { fieldPaths: [visibilityField] }
     }];
   });
 
@@ -1037,34 +1030,32 @@ async function handleSecretChatSync(
   if (!members.includes(uid)) return json({ error: "You are not a member of this chat." }, 403);
 
   const isGroup = chat.fields?.isGroup?.booleanValue === true;
-  const lockedFor: string[] = [];
-  if (!isGroup && members.length === 2) {
-    for (const ownerUid of members) {
+  const visibilityFields: Record<string, unknown> = {};
+  const updateMasks: string[] = [];
+  for (const ownerUid of members) {
+    let shouldHide = false;
+    if (!isGroup && members.length === 2) {
       const peerUid = members.find((memberUid) => memberUid !== ownerUid);
-      if (!peerUid) continue;
-      const config = await getFirestoreDocument(accessToken, secretLockPath(ownerUid));
-      if (stringArrayField(config, "lockedContactUids").includes(peerUid)) {
-        lockedFor.push(ownerUid);
+      if (peerUid) {
+        const config = await getFirestoreDocument(accessToken, secretLockPath(ownerUid));
+        shouldHide = stringArrayField(config, "lockedContactUids").includes(peerUid);
       }
     }
+    const fieldPath = "secretLockedFor_" + ownerUid;
+    visibilityFields[fieldPath] = { booleanValue: shouldHide };
+    updateMasks.push(fieldPath);
   }
 
   const update = await firestoreRequest(
     accessToken,
-    chatPath + "?updateMask.fieldPaths=secretLockedForUids",
+    chatPath + "?" + updateMasks.map((field) => "updateMask.fieldPaths=" + encodeURIComponent(field)).join("&"),
     {
       method: "PATCH",
-      body: JSON.stringify({
-        fields: {
-          secretLockedForUids: {
-            arrayValue: { values: lockedFor.map((memberUid) => ({ stringValue: memberUid })) }
-          }
-        }
-      })
+      body: JSON.stringify({ fields: visibilityFields })
     }
   );
   if (!update.ok) return json({ error: "Could not synchronize chat privacy." }, 500);
-  return json({ ok: true, secretLockedForUids: lockedFor });
+  return json({ ok: true });
 }
 
 async function handleSecretChatLock(
