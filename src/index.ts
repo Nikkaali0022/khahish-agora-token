@@ -977,9 +977,11 @@ async function handleSecretChatContacts(
   if (body.action === "add") contacts.add(body.contactUid);
   else contacts.delete(body.contactUid);
 
-  // Update the per-chat visibility index before committing the lock config.
-  // If this fails, keep the old config so the normal chat list cannot leak previews.
-  await syncSecretLockedChatList(accessToken, uid, [...contacts]);
+  // Lock first when adding a contact, so a failed config write never hides
+  // the contact from security rules without the matching server-side config.
+  if (body.action === "add") {
+    await syncSecretLockedChatList(accessToken, uid, [...contacts]);
+  }
 
   const updateResponse = await firestoreRequest(
     accessToken,
@@ -1001,6 +1003,12 @@ async function handleSecretChatContacts(
   if (!updateResponse.ok) {
     console.error("Secret Locked Chats contact update failed:", updateResponse.status);
     return json({ error: "Could not update your locked contacts. Please try again." }, 500);
+  }
+
+  // When removing a lock, update the config first. A failed visibility sync
+  // then leaves the chat hidden (safe) until the next config refresh repairs it.
+  if (body.action === "remove") {
+    await syncSecretLockedChatList(accessToken, uid, [...contacts]);
   }
 
   return json({ ok: true, lockedContactUids: [...contacts] });
