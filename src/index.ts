@@ -977,6 +977,10 @@ async function handleSecretChatContacts(
   if (body.action === "add") contacts.add(body.contactUid);
   else contacts.delete(body.contactUid);
 
+  // Update the per-chat visibility index before committing the lock config.
+  // If this fails, keep the old config so the normal chat list cannot leak previews.
+  await syncSecretLockedChatList(accessToken, uid, [...contacts]);
+
   const updateResponse = await firestoreRequest(
     accessToken,
     path + "?updateMask.fieldPaths=lockedContactUids&updateMask.fieldPaths=updatedAt",
